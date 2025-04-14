@@ -1,0 +1,477 @@
+---
+title: "Nanopore pipeline"
+author: "Ayesha"
+date: "2025-01-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Install prerequisites for the quality control, alignment and preprocessing. 
+Note: install and execute these in base conda environment and then use analysis tools in QIIME2 to avoid dependency conflicts 
+
+```{r cars}
+ # Create and activate a conda environment\
+conda create -n nanopore_env python=3.9 -y
+conda activate nanopore_env
+
+ # Install NanoFilt, NanoStat, NanoPlot (python-based tools)
+pip install NanoFilt NanoPlot NanoStat
+
+# Install Porechop
+pip install porechop 
+#if porechop doesnt install, use the following as alternative
+pip install cutadapt
+
+#Download and compile Minimap2:
+# Download Minimap2
+git clone https://github.com/lh3/minimap2.git
+cd minimap2
+make
+# Add minimap2 to PATH (optional)
+export PATH=$PATH:$(pwd)
+
+```
+
+#STEP 1: Quality Control
+1. Perform quality checks on fastq files (e.g., length distribution, quality scores).
+2. Filter out low-quality reads using `NanoFilt` 
+```{r}
+#for it, enter the folder where your reads folder is located, The for loop iterates through all .fastq files in the reads_extracted folder.
+#!/bin/bash
+
+# Create results directory if it doesn't exist
+mkdir -p results
+
+# Loop through each FASTQ file in the reads_extracted folder
+for file in reads_extracted/*.fastq; do
+    # Extract the base name of the file (e.g., sample1 from sample1.fastq)
+    base=$(basename "$file" .fastq)
+
+    # Run NanoFilt for each file and save the output in the results directory
+    NanoFilt -q 9 -l 1000 "$file" > "results/${base}_filtered.fastq"
+
+    echo "Processed $file -> results/${base}_filtered.fastq"
+done
+
+#the filtered fastq reads will be saved in "results" folder.
+```
+
+#STEP 2: Activate QIIME2 and Import data
+
+
+```{r pressure, echo=FALSE}
+
+
+# Import feature table
+qiime tools import \
+  --input-path features/raw_feature_table.biom \
+  --type 'FeatureTable[Frequency]' \
+  --input-format BIOMV210Format \
+  --output-path output/feature_table.qza
+
+# Import metadata
+cp metadata/metadata_table metadata.tsv
+qiime metadata tabulate \
+  --m-input-file metadata/metadata_table \
+  --o-visualization output/metadata.qzv
+
+#before importing the reads, rename and compress files as the further steps ahead require the specific pattern 
+
+#Rename Files
+# Navigate to the directory containing filtered files
+cd results
+
+#if using "???" Rename each file to match QIIME2's required format
+for file in *_filtered.fastq; do
+    sample=$(basename "$file" _filtered.fastq)
+    mv "$file" "${sample}_L001_R1_001.fastq"
+done
+
+#compress the file
+gzip results/*.fastq
+
+#compress without name change
+for file in results/*_filtered.fastq; do [[ -f "$file" ]] && gzip "$file" && echo "Compressed: $file"; done
+
+##potential errors:
+###1. If the files seems incorrectly zipped, you can check it by following: 
+file results/* 
+expected output: 
+barcode01_L001_R1_001.fastq.gz: gzip compressed data
+barcode02_L001_R1_001.fastq.gz: gzip compressed data
+and,
+ls results/
+expected output:
+barcode01_L001_R1_001.fastq.gz
+barcode02_L001_R1_001.fastq.gz
+
+###2. to see if QIIME is locating file directly:
+find $PWD/results -name "*.fastq.gz"
+
+###3. If any unrelated files exist, remove them:
+rm results/unwanted_file
+
+###4. create a manifest
+nano results/manifest.csv
+
+!/bin/bash
+
+Set the output file name
+manifest_file="results/manifest.csv"
+
+Write the header line to the manifest file
+echo "sample-id,absolute-filepath,direction" > "$manifest_file"
+
+Loop through all .fastq.gz files in the results directory
+for file in results/*.fastq.gz; do
+    # Extract the sample ID from the filename
+    sample_id=$(basename "$file" | cut -d_ -f1)
+    
+    # Append the sample details to the manifest file
+    echo "$sample_id,$PWD/$file,forward" >> "$manifest_file"
+done
+
+echo "Manifest file created: $manifest_file"
+
+
+Save the script as create_manifest.sh 
+chmod +x create_manifest.sh
+./create_manifest.sh
+
+###5. if file is comma-separated (.csv), convert it into tab-separated (.tsv)
+sed 's/,/\t/g' results/manifest.csv > results/manifest.tsv
+verify the new manifest file
+cat -T results/manifest.tsv
+
+expected outcome:
+sample-id^Iabsolute-filepath^Idirection
+barcode01^I/home/ayesha/nanopore/results/barcode01_L001_R1_001.fastq.gz^Iforward
+
+# Import FASTQ files as single-end reads (if these are barcoded single reads)
+# For PHRED+33:
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path results/manifest.tsv \
+  --output-path demux.qza \
+  --input-format SingleEndFastqManifestPhred33V2
+
+# For PHRED+64:
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path results/manifest.tsv \
+  --output-path demux.qza \
+  --input-format SingleEndFastqManifestPhred64V2
+
+# Summarize sequence quality
+qiime demux summarize \
+  --i-data output/demux.qza \
+  --o-visualization output/demux.qzv
+```
+
+#STEP 3: Denoising with DADA2
+Assess and filter the sequencing reads.
+```{r}
+
+# Denoise and filter reads (e.g., using DADA2)
+qiime dada2 denoise-single \
+  --i-demultiplexed-seqs output/demux.qza \
+  --p-trim-left 0 \
+  --p-trunc-len 300 \
+  --o-representative-sequences output/rep-seqs.qza \
+  --o-table output/filtered-table.qza \
+  --o-denoising-stats output/denoising-stats.qza
+
+```
+
+##Assign taxonomy
+Classify features using a pre-trained classifier (e.g., SILVA, Greengenes).
+```{r}
+# Import taxonomy reference database
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-path taxonomy/taxonomy_table \
+  --output-path output/taxonomy.qza
+
+# Assign taxonomy to features
+qiime feature-classifier classify-sklearn \
+  --i-classifier taxonomy/taxonomy.qza \
+  --i-reads output/rep-seqs.qza \
+  --o-classification output/taxonomy-assigned.qza
+
+# Visualize taxonomy
+qiime metadata tabulate \
+  --m-input-file output/taxonomy-assigned.qza \
+  --o-visualization output/taxonomy.qzv
+
+```
+
+##Generate Phylogenetic tree
+```{r}
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences output/rep-seqs.qza \
+  --o-alignment output/aligned-rep-seqs.qza \
+  --o-masked-alignment output/masked-aligned-rep-seqs.qza \
+  --o-tree output/unrooted-tree.qza \
+  --o-rooted-tree output/rooted-tree.qza
+
+```
+
+##Diversity Analysis
+```{r}
+# Core metrics
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny output/rooted-tree.qza \
+  --i-table output/filtered-table.qza \
+  --p-sampling-depth 1000 \
+  --m-metadata-file metadata/metadata_table \
+  --output-dir output/core-metrics-results
+
+# Visualize alpha diversity
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity output/core-metrics-results/faith_pd_vector.qza \
+  --m-metadata-file metadata/metadata_table \
+  --o-visualization output/faith-pd-significance.qzv
+
+# Visualize beta diversity
+qiime diversity beta-group-significance \
+  --i-distance-matrix output/core-metrics-results/unweighted_unifrac_distance_matrix.qza \
+  --m-metadata-file metadata/metadata_table \
+  --o-visualization output/unweighted-unifrac-significance.qzv
+
+```
+
+##Cretae taxonomy barplots
+```{r}
+qiime taxa barplot \
+  --i-table output/filtered-table.qza \
+  --i-taxonomy output/taxonomy-assigned.qza \
+  --m-metadata-file metadata/metadata_table \
+  --o-visualization output/taxa-bar-plots.qzv
+
+```
+
+##Export data for downstream analysis
+```{r}
+qiime tools export \
+  --input-path output/filtered-table.qza \
+  --output-path export/
+
+qiime tools export \
+  --input-path output/taxonomy-assigned.qza \
+  --output-path export/
+
+```
+
+#Install and Compile SAMtools, HTSlib, and BCFtools
+These tools remain useful for working with aligned and processed data.
+
+```{r}
+sudo apt install autoconf
+git clone https://github.com/samtools/htslib.git
+git clone https://github.com/samtools/samtools.git
+git clone https://github.com/samtools/bcftools.git
+
+# HTSlib Installation
+cd htslib
+git submodule update --init --recursive
+autoreconf -i
+./configure
+make
+cd ..
+
+# SAMtools Installation
+cd samtools
+autoheader
+autoconf -Wno-syntax
+./configure
+make
+cd ..
+
+# BCFtools Installation
+cd bcftools
+autoheader
+autoconf -Wno-syntax
+./configure
+make
+
+#Minimap installation
+git clone https://github.com/lh3/minimap2.git
+cd minimap2 cd minimap2 && make && sudo cp minimap2 /usr/local/bin/
+cd ..
+
+#Install Picard for File Manipulations
+git clone https://github.com/broadinstitute/picard.git
+cd picard
+git checkout 5db8017
+./gradlew shadowJar
+
+#Install GATK for Variant Calling
+#GATK can still be used for variant calling with Nanopore reads.
+wget https://github.com/broadinstitute/gatk/releases/download/4.2.6.1/gatk-4.2.6.1.zip
+unzip gatk-4.2.6.1.zip
+
+#Install SRA Toolkit
+wget https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/3.1.1/sratoolkit.3.1.1-ubuntu64.tar.gz
+mkdir sratoolkit
+tar -xzf sratoolkit.3.1.1-ubuntu64.tar.gz -C sratoolkit
+./sratoolkit/sratoolkit.3.1.1-ubuntu64/bin/vdb-config --interactive
+./sratoolkit/sratoolkit.3.1.1-ubuntu64/bin/fasterq-dump
+
+# Install Porechop (for adapter trimming)
+git clone https://github.com/rrwick/Porechop.git
+cd Porechop && sudo python3 setup.py install
+
+# Install Medaka (variant calling for nanopore data)
+pip install medaka
+
+
+# Install Nanopolish (for methylation/base modification analysis)
+git clone https://github.com/jts/nanopolish.git
+cd nanopolish && make && sudo cp nanopolish /usr/local/bin/
+
+# Install pycoQC (for nanopore sequencing quality control)
+pip install pycoQC
+
+```
+
+#Create a bin Directory and Set Up Symlinks
+
+```{r}
+mkdir nbin
+cd nbin
+ln -s /home/ayesha/software/minimap2/minimap2 minimap2
+ln -s /home/ayesha/software/htslib/bgzip bgzip
+ln -s /home/ayesha/software/samtools/samtools samtools
+ln -s /home/ayesha/software/bcftools/bcftools bcftools
+ln -s /home/ayesha/software/sratoolkit/sratoolkit.3.1.1-ubuntu64/bin/fasterq-dump fasterq-dump
+ln -s /home/ayesha/software/nanofilt/nanofilt nanofilt
+ls  # Verify the symlinks
+
+#Add bin Directory to PATH in .bashrc
+nano ~/.bashrc
+
+# Add at the end:
+export PATH="$HOME/abin:$PATH"
+
+# Reload .bashrc
+source ~/.bashrc
+
+```
+
+#Set Up the Workspace
+
+```{r}
+mkdir nanopore_pipeline
+cd nanopore_pipeline
+
+# Create directories for organization
+mkdir reads taxonomy metadata features output
+# Move your data into the appropriate folders
+mv /path_to_your_data/*.fastq reads/
+mv /path_to_your_data/taxonomy_table.tsv taxonomy/
+mv /path_to_your_data/metadata.csv metadata/
+mv /path_to_your_data/raw_feature_table.tsv features/
+
+```
+
+#Quality Filtering
+Filter the reads for quality using NanoFilt:
+
+```{r}
+cd reads
+nanofilt -q 7 < input_reads.fastq > filtered_reads.fastq
+
+```
+
+#Taxonomic Classification
+
+```{r}
+#Import your data into QIIME2:
+qiime tools import \
+    --type 'SampleData[SequencesWithQuality]' \
+    --input-path filtered_reads.fastq \
+    --output-path demux.qza
+
+#Perform taxonomic classification:
+qiime feature-classifier classify-sklearn \
+    --i-classifier /path_to_pretrained_classifier.qza \
+    --i-reads demux.qza \
+    --o-classification taxonomy.qza
+
+#Export the results:
+qiime tools export --input-path taxonomy.qza --output-path taxonomy/
+
+```
+
+#Alignment (Minimap2)
+
+```{r}
+minimap2 -ax map-ont reference_genome.fa filtered_reads.fastq > aligned.sam
+samtools view -bS aligned.sam > aligned.bam
+samtools sort aligned.bam -o aligned.sorted.bam
+samtools index aligned.sorted.bam
+
+```
+
+#Generate Feature Tables
+If your raw feature table and taxonomy data need updating:
+Use QIIME2’s feature table methods
+
+```{r}
+qiime feature-table summarize \
+    --i-table feature_table.qza \
+    --o-visualization feature_table_summary.qzv
+```
+
+#Metadata Analysis
+Incorporate your metadata for diversity or statistical analysis:
+
+```{r}
+qiime diversity core-metrics-phylogenetic \
+    --i-table feature_table.qza \
+    --m-metadata-file metadata/metadata.csv \
+    --output-dir core_metrics_results
+
+```
+
+#Visualization in QIIME2
+
+```{r}
+#1. Taxonomy Bar Plots
+qiime taxa barplot \
+    --i-table feature_table.qza \
+    --i-taxonomy taxonomy.qza \
+    --m-metadata-file metadata/metadata.csv \
+    --o-visualization taxonomy_barplot.qzv
+
+qiime tools view taxonomy_barplot.qzv
+
+#2. Alpha and Beta Diversity
+#Generate Diversity Metrics:
+qiime diversity core-metrics-phylogenetic \
+    --i-table feature_table.qza \
+    --i-phylogeny rooted-tree.qza \
+    --m-metadata-file metadata/metadata.csv \
+    --p-sampling-depth 10000 \
+    --output-dir core_metrics_results
+#Visualize Alpha Diversity:
+qiime diversity alpha-group-significance \
+    --i-alpha-diversity core_metrics_results/faith_pd_vector.qza \
+    --m-metadata-file metadata/metadata.csv \
+    --o-visualization alpha_diversity_significance.qzv
+#Visualize Beta Diversity:
+qiime diversity beta-group-significance \
+    --i-distance-matrix core_metrics_results/unweighted_unifrac_distance_matrix.qza \
+    --m-metadata-file metadata/metadata.csv \
+    --m-metadata-column sample_type \
+    --o-visualization beta_diversity_significance.qzv \
+    --p-pairwise
+#View the .qzv files:
+qiime tools view alpha_diversity_significance.qzv
+qiime tools view beta_diversity_significance.qzv
+
+```
+
